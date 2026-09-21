@@ -67,14 +67,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 
 from app.engine.mapping import ListingEntry, MatchResult
 
 log = logging.getLogger(__name__)
 
 
-class Direction(str, Enum):
+class Direction(StrEnum):
     """
     Which way a change goes. Used for prioritisation and for the guardrails.
 
@@ -93,7 +93,7 @@ class Direction(str, Enum):
     NONE = "none"
 
 
-class SkipReason(str, Enum):
+class SkipReason(StrEnum):
     """Why a product was not changed. Every one is shown on the dashboard."""
 
     ALREADY_CORRECT = "already_correct"

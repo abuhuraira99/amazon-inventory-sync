@@ -108,7 +108,7 @@ class Base(DeclarativeBase):
 # Enumerations
 # ===========================================================================
 
-class SyncMode(str, enum.Enum):
+class SyncMode(enum.StrEnum):
     """
     How far a run is allowed to go. The single most important control in the
     system: it is what makes it defensible to point this at an account that
@@ -120,7 +120,7 @@ class SyncMode(str, enum.Enum):
     AUTOMATIC = "automatic"      # send on its own, guardrails supervising
 
 
-class FeedKind(str, enum.Enum):
+class FeedKind(enum.StrEnum):
     """
     Full feeds and delta feeds must be treated by DIFFERENT rules.
 
@@ -136,7 +136,7 @@ class FeedKind(str, enum.Enum):
     UNKNOWN = "unknown"
 
 
-class FileStatus(str, enum.Enum):
+class FileStatus(enum.StrEnum):
     DISCOVERED = "discovered"      # seen on the server, not yet downloaded
     DOWNLOADED = "downloaded"      # bytes on disk, not yet verified
     VERIFIED = "verified"          # zip opens, checksum matches
@@ -147,14 +147,14 @@ class FileStatus(str, enum.Enum):
     FAILED = "failed"
 
 
-class RunTrigger(str, enum.Enum):
+class RunTrigger(enum.StrEnum):
     SCHEDULE = "schedule"
     MANUAL = "manual"
     ROLLBACK = "rollback"
     CATALOG_REFRESH = "catalog_refresh"
 
 
-class RunStatus(str, enum.Enum):
+class RunStatus(enum.StrEnum):
     RUNNING = "running"
     COMPLETED = "completed"
     NO_CHANGES = "no_changes"           # a good outcome, not a failure
@@ -165,7 +165,7 @@ class RunStatus(str, enum.Enum):
     PAUSED = "paused"                   # the kill switch was on
 
 
-class BatchStatus(str, enum.Enum):
+class BatchStatus(enum.StrEnum):
     PENDING = "pending"
     AWAITING_APPROVAL = "awaiting_approval"
     APPROVED = "approved"
@@ -178,7 +178,7 @@ class BatchStatus(str, enum.Enum):
     ROLLED_BACK = "rolled_back"
 
 
-class PushMethod(str, enum.Enum):
+class PushMethod(enum.StrEnum):
     """
     Two ways to write a quantity, used for different batch sizes.
 
@@ -196,7 +196,7 @@ class PushMethod(str, enum.Enum):
     FEEDS_API = "feeds_api"
 
 
-class ItemResult(str, enum.Enum):
+class ItemResult(enum.StrEnum):
     PENDING = "pending"
     ACCEPTED = "accepted"        # Amazon took it
     VERIFIED = "verified"        # and we read it back and confirmed
@@ -206,7 +206,7 @@ class ItemResult(str, enum.Enum):
     ERROR = "error"
 
 
-class MapSource(str, enum.Enum):
+class MapSource(enum.StrEnum):
     """
     How a barcode was matched to a SKU, in descending order of trust.
 

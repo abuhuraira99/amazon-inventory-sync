@@ -43,14 +43,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 
 from app.engine.decision import Decision, Direction
 
 log = logging.getLogger(__name__)
 
 
-class Severity(str, Enum):
+class Severity(StrEnum):
     """
     How a failed check is treated.
 
