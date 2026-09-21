@@ -1,0 +1,67 @@
+name: Feature request
+description: Suggest a capability or a change in behaviour
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Worth knowing before you write this up: the project is deliberately
+        narrow. It syncs quantities from one supplier feed to one marketplace,
+        and it will not grow into a general Amazon management tool. Pricing in
+        particular is permanently out of scope — see
+        [SECURITY.md](../blob/main/SECURITY.md) for why that is structural
+        rather than a preference.
+
+        That is not a discouragement from asking. It is so you know what a
+        useful proposal looks like here.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >
+        What are you trying to do that is hard or impossible today? Describe
+        the situation rather than the feature — the best solution is often not
+        the one either of us thought of first.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like it to do
+    validations:
+      required: true
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What kind of change is this?
+      options:
+        - A new setting (behaviour that should be configurable)
+        - A change to existing behaviour
+        - A new capability
+        - Documentation
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: safety
+    attributes:
+      label: Effect on the safety properties
+      description: >
+        Would this change what gets written to a seller account, when, or how
+        much? Does it touch undo, the durability barrier, the guardrails, the
+        scope filter, or the no-price rule? "No effect" is a fine answer — but
+        it is worth checking, because these are the parts where a reasonable
+        change can do quiet damage.
+      placeholder: "e.g. no effect — it only changes what the dashboard shows"
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you have considered
+      description: Including working around it outside this system.

@@ -1,0 +1,1054 @@
+"""
+The write path: sending, verifying, undoing, and recovering.
+
+WHY THIS FILE EXISTS
+====================
+Everything tested here can change quantities on a live Amazon account, and
+before this file existed it was the least-covered code in the project. The
+well-covered modules were the pure ones -- barcode rules, decision rules,
+guardrails -- which are the easy ones. Coverage was inverted with respect to
+risk.
+
+HOW AMAZON IS FAKED
+===================
+At the HTTP transport, with :class:`httpx.MockTransport`, and nowhere higher.
+Everything above the socket therefore runs for real: the rate limiter, the retry
+and backoff logic, the 401 token refresh, the error extraction, the payload
+builders in :mod:`app.amazon.listings`, and -- most importantly -- the price
+guard in :mod:`app.amazon.guard`, which is invoked inside
+``SpApiClient.request``. Faking at a higher level would bypass the one
+check that matters most: the no-price guard.
+
+WHAT EACH TEST IS REALLY ASSERTING
+==================================
+Not "the function returns the right value" but "this specific way of losing the
+client money cannot happen":
+
+  * a batch is durable before anything is sent, so a crash cannot leave Amazon
+    changed with no record of what it was
+  * one broken SKU cannot abort every good one behind it
+  * a missing role stops the run instead of producing thousands of identical errors
+  * "Amazon said ACCEPTED but the quantity did not change" is caught, because
+    that is the silent failure that has been costing this account stock
+  * undo restores the exact previous quantity, taken from Amazon
+  * a batch stranded mid-send by a crash is settled rather than left to rot
+"""
+
+from __future__ import annotations
+
+import json
+
+import httpx
+import pytest
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import sessionmaker
+
+from app.amazon.client import SpApiClient, SpApiPermissionError
+from app.amazon.guard import PriceFieldRefused
+from app.core import settings_store
+from app.engine.decision import Decision, Direction
+from app.engine.pipeline import RunOutcome, _recover_interrupted_batches
+from app.engine.pusher import (
+    confirm_from_catalogue,
+    create_batch,
+    send_batch,
+    verify_batch,
+)
+from app.engine.rollback import RollbackError, execute_rollback, plan_rollback
+from app.models import (
+    AmazonListing,
+    Base,
+    BatchStatus,
+    ItemResult,
+    PushBatch,
+    PushItem,
+    Run,
+    RunStatus,
+    RunTrigger,
+    SyncMode,
+    utcnow,
+)
+
+# ---------------------------------------------------------------------------
+# Fakes
+# ---------------------------------------------------------------------------
+
+
+class _StubTokens:
+    """Stands in for the LWA token provider. Never reaches Amazon."""
+
+    def __init__(self) -> None:
+        self.invalidations = 0
+
+    def token(self) -> str:
+        return "test-access-token"
+
+    def invalidate(self) -> None:
+        self.invalidations += 1
+
+
+def _client(handler, *, dry_run: bool = False) -> SpApiClient:
+    """
+    A real SpApiClient wired to a mock transport.
+
+    ``handler`` receives an :class:`httpx.Request` and returns an
+    :class:`httpx.Response`.
+    """
+    client = SpApiClient(
+        _StubTokens(),
+        endpoint="https://sellingpartnerapi-na.amazon.com",
+        marketplace_id="ATVPDKIKX0DER",
+        seller_id="A1TESTSELLER",
+        dry_run=dry_run,
+    )
+    client._client = httpx.Client(transport=httpx.MockTransport(handler))
+    return client
+
+
+def _accept_everything(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, json={"status": "ACCEPTED", "submissionId": "sub-1"})
+
+
+def _listing_body(quantity: int) -> dict:
+    """Amazon's GET listings shape, as observed."""
+    return {
+        "sku": "x",
+        "fulfillmentAvailability": [
+            {
+                "fulfillmentChannelCode": "DEFAULT",
+                "quantity": quantity,
+                "leadTimeToShipMaxDays": 2,
+            }
+        ],
+        "productTypes": [{"productType": "SOUND_AND_RECORDING"}],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def run(session) -> Run:
+    r = Run(
+        trigger=RunTrigger.MANUAL,
+        triggered_by="test",
+        mode=SyncMode.AUTOMATIC,
+        status=RunStatus.RUNNING,
+    )
+    session.add(r)
+    session.flush()
+    return r
+
+
+def _decision(sku: str, *, now: int, want: int) -> Decision:
+    return Decision(
+        seller_sku=sku,
+        barcode=sku.rsplit("-", 1)[-1],
+        current_quantity=now,
+        desired_quantity=want,
+        vendor_stock=want,
+        direction=Direction.DOWN if want < now else Direction.UP,
+        reason=f"vendor has {want}",
+    )
+
+
+@pytest.fixture
+def listings(session) -> None:
+    """Amazon's side of the picture, so verification has something to update."""
+    for sku, qty in (
+        ("EXAMPLE-0007298811035", 7),
+        ("EXAMPLE-0001749188257", 4),
+    ):
+        session.add(
+            AmazonListing(
+                seller_sku=sku,
+                sku_prefix="EXAMPLE-",
+                barcode=sku.rsplit("-", 1)[-1],
+                quantity=qty,
+                product_type="SOUND_AND_RECORDING",
+                lead_time_to_ship_days=2,
+                blacklisted=False,
+                synced_at=utcnow(),
+                present_in_last_sync=True,
+            )
+        )
+    session.flush()
+
+
+# ===========================================================================
+# The undo trail
+# ===========================================================================
+
+
+class TestTheUndoTrail:
+    def test_every_item_records_the_quantity_amazon_had(self, session, run):
+        """
+        Undo is only possible because of this column. If ``previous_quantity``
+        is ever null, that product cannot be put back.
+        """
+        batch = create_batch(
+            session,
+            run.id,
+            [
+                _decision("EXAMPLE-0007298811035", now=7, want=0),
+                _decision("EXAMPLE-0001749188257", now=4, want=11),
+            ],
+        )
+        items = session.execute(
+            select(PushItem).where(PushItem.batch_id == batch.id)
+        ).scalars().all()
+
+        assert len(items) == 2
+        assert all(i.previous_quantity is not None for i in items)
+        assert {i.previous_quantity for i in items} == {7, 4}
+
+    def test_the_batch_is_committed_before_anything_is_sent(self, tmp_path, run):
+        """
+        THE DURABILITY BARRIER.
+
+        A file-backed database is used here, not the in-memory one, precisely so
+        that a second connection cannot see uncommitted work. The mock transport
+        opens its own session and asserts that by the time Amazon is first
+        called, the batch and every previous quantity are already on disk.
+
+        Before this was fixed, the whole run -- ingest, decide, send, verify --
+        was a single transaction committed at the very end. A container killed
+        mid-send (a deploy, an OOM, a reboot) left Amazon changed and no record
+        of what it had been, so those products could not be put back. That is the
+        one promise this system makes.
+        """
+        url = f"sqlite+pysqlite:///{tmp_path / 'durability.db'}"
+        engine = create_engine(url)
+        Base.metadata.create_all(engine)
+        Factory = sessionmaker(bind=engine, expire_on_commit=False)
+
+        session = Factory()
+        r = Run(
+            trigger=RunTrigger.MANUAL, triggered_by="test",
+            mode=SyncMode.AUTOMATIC, status=RunStatus.RUNNING,
+        )
+        session.add(r)
+        session.flush()
+        batch = create_batch(session, r.id, [_decision("EXAMPLE-0007298811035", now=7, want=0)])
+        batch_id = batch.id
+
+        seen: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            # A genuinely independent connection to the same database file.
+            observer = Factory()
+            try:
+                found = observer.get(PushBatch, batch_id)
+                seen["batch_visible"] = found is not None
+                seen["status"] = found.status if found else None
+                seen["previous_quantities"] = [
+                    i.previous_quantity
+                    for i in observer.execute(
+                        select(PushItem).where(PushItem.batch_id == batch_id)
+                    ).scalars()
+                ]
+            finally:
+                observer.close()
+            return _accept_everything(request)
+
+        client = _client(handler)
+        send_batch(
+            session, client, batch,
+            decisions_by_sku={"EXAMPLE-0007298811035": _decision(
+                "EXAMPLE-0007298811035", now=7, want=0
+            )},
+        )
+
+        assert seen["batch_visible"], (
+            "the batch was not durable when Amazon was first called: a crash here "
+            "would change Amazon with no record of the previous quantities"
+        )
+        assert seen["status"] is BatchStatus.SENDING, (
+            "the batch must be committed as SENDING before the first call, so a "
+            "crash is distinguishable from 'nothing was sent'"
+        )
+        assert seen["previous_quantities"] == [7]
+
+        session.close()
+        engine.dispose()
+
+
+# ===========================================================================
+# Sending
+# ===========================================================================
+
+
+class TestSending:
+    def test_one_rejected_sku_does_not_stop_the_others(self, session, run, listings):
+        """
+        A batch can hold thousands of products. Amazon rejects individual SKUs for
+        reasons peculiar to that listing -- 8541 invalid values, 8684 linked to
+        more than one GCID. Aborting the batch would mean one broken listing
+        holding up the whole catalogue.
+        """
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "0001749188257" in str(request.url):
+                return httpx.Response(
+                    400,
+                    json={"errors": [{"code": "8541", "message": "Invalid value"}]},
+                )
+            return _accept_everything(request)
+
+        decisions = [
+            _decision("EXAMPLE-0007298811035", now=7, want=0),
+            _decision("EXAMPLE-0001749188257", now=4, want=11),
+        ]
+        batch = create_batch(session, run.id, decisions)
+        summary = send_batch(
+            session, _client(handler), batch,
+            decisions_by_sku={d.seller_sku: d for d in decisions},
+        )
+
+        assert summary.accepted == 1
+        assert summary.rejected == 1
+        assert summary.codes == {"8541": 1}
+        assert batch.status is BatchStatus.PARTIALLY_FAILED
+
+        by_sku = {
+            i.seller_sku: i
+            for i in session.execute(
+                select(PushItem).where(PushItem.batch_id == batch.id)
+            ).scalars()
+        }
+        assert by_sku["EXAMPLE-0007298811035"].result is ItemResult.ACCEPTED
+        assert by_sku["EXAMPLE-0001749188257"].result is ItemResult.REJECTED
+        assert by_sku["EXAMPLE-0001749188257"].amazon_code == "8541"
+
+    def test_a_missing_role_stops_the_batch_instead_of_repeating_5000_times(
+        self, session, run, listings
+    ):
+        """
+        The most likely first-deployment failure. Amazon answers 403 to every
+        call, so continuing would produce one identical error per SKU and an
+        unreadable audit trail. Unsent items stay PENDING so a retry after the
+        role is granted resumes exactly where this stopped.
+        """
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                403,
+                json={"errors": [{"code": "Unauthorized", "message": "Access to requested resource is denied."}]},
+            )
+
+        decisions = [
+            _decision("EXAMPLE-0007298811035", now=7, want=0),
+            _decision("EXAMPLE-0001749188257", now=4, want=11),
+        ]
+        batch = create_batch(session, run.id, decisions)
+        summary = send_batch(
+            session, _client(handler), batch,
+            decisions_by_sku={d.seller_sku: d for d in decisions},
+        )
+
+        assert batch.status is BatchStatus.FAILED
+        assert summary.accepted == 0
+        assert summary.errors, "the operator must be told why nothing was sent"
+        still_pending = session.execute(
+            select(PushItem).where(
+                PushItem.batch_id == batch.id,
+                PushItem.result == ItemResult.PENDING,
+            )
+        ).scalars().all()
+        assert len(still_pending) == 2, "unsent items must stay retryable"
+
+    def test_practice_mode_builds_the_real_payload_and_sends_nothing(
+        self, session, run, listings
+    ):
+        """
+        Practice mode has to be a genuine rehearsal, or weeks spent in it prove
+        nothing. Same code path, same payload, no socket.
+        """
+        calls: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return _accept_everything(request)
+
+        decisions = [_decision("EXAMPLE-0007298811035", now=7, want=0)]
+        batch = create_batch(session, run.id, decisions)
+        client = _client(handler, dry_run=True)
+        summary = send_batch(
+            session, client, batch,
+            decisions_by_sku={d.seller_sku: d for d in decisions},
+        )
+
+        assert calls == [], "practice mode reached the network"
+        assert summary.accepted == 1, "practice mode must still report what it would do"
+        assert client.dry_run_payloads, "the payload should be recorded for review"
+
+        payload = json.dumps(client.dry_run_payloads[0])
+        assert "quantity" in payload
+        assert "price" not in payload.lower()
+
+    def test_a_price_in_the_payload_is_refused_at_the_transport(self, session, run):
+        """
+        The one thing this system must never do. Asserted against the real client, not
+        against the guard in isolation, because what matters is that no code
+        path can reach the socket with a price on it.
+        """
+        client = _client(_accept_everything)
+        with pytest.raises(PriceFieldRefused):
+            client.patch(
+                "/listings/2021-08-01/items/A1TESTSELLER/EXAMPLE-0007298811035",
+                operation="listings.patch",
+                json_body={"patches": [{"op": "replace", "value": [{"our_price": 9.99}]}]},
+            )
+
+
+# ===========================================================================
+# Verification -- the silent failure
+# ===========================================================================
+
+
+class TestVerification:
+    def test_accepted_but_not_applied_is_caught(self, session, run, listings):
+        """
+        THE SILENT FAILURE.
+
+        Amazon answers ACCEPTED and then does nothing -- most often because the
+        SKU does not exist in the exact form it was sent, which is what the
+        zero-padding rule is about. Trusting the acceptance is how this account
+        comes to have thousands of quantities out of step while its tooling reports
+        success every day.
+
+        The batch is aged past ``VERIFY_CONFIRM_DEADLINE`` because that is what
+        distinguishes this from Amazon merely being slow: a change still absent
+        hours later has genuinely not been applied. See
+        :class:`TestAmazonTakesItsTimeToApplyAChange` for the other half.
+        """
+        from datetime import timedelta
+
+        from app.engine.pusher import VERIFY_CONFIRM_DEADLINE
+        from app.models import utcnow
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                # Amazon still shows the old number: the change did not stick.
+                return httpx.Response(200, json=_listing_body(7))
+            return _accept_everything(request)
+
+        decisions = [_decision("EXAMPLE-0007298811035", now=7, want=0)]
+        batch = create_batch(session, run.id, decisions)
+        client = _client(handler)
+        send_batch(session, client, batch, decisions_by_sku={d.seller_sku: d for d in decisions})
+        batch.sent_at = utcnow() - VERIFY_CONFIRM_DEADLINE - timedelta(minutes=1)
+        session.flush()
+
+        summary = verify_batch(session, client, batch, settle_seconds=0)
+
+        assert summary.verified == 0
+        assert summary.not_applied == 1
+        item = session.execute(
+            select(PushItem).where(PushItem.batch_id == batch.id)
+        ).scalar_one()
+        assert item.result is ItemResult.NOT_APPLIED
+        assert item.verified_quantity == 7
+        assert "still shows 7" in (item.amazon_message or "")
+        assert batch.status is not BatchStatus.VERIFIED
+
+    def test_a_sku_that_does_not_exist_is_reported_as_not_applied(
+        self, session, run, listings
+    ):
+        """A 404 on read-back means we patched a SKU that is not on the account."""
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(404, json={"errors": [{"code": "NOT_FOUND"}]})
+            return _accept_everything(request)
+
+        decisions = [_decision("EXAMPLE-0007298811035", now=7, want=0)]
+        batch = create_batch(session, run.id, decisions)
+        client = _client(handler)
+        send_batch(session, client, batch, decisions_by_sku={d.seller_sku: d for d in decisions})
+
+        summary = verify_batch(session, client, batch, settle_seconds=0)
+
+        assert summary.not_applied == 1
+        item = session.execute(
+            select(PushItem).where(PushItem.batch_id == batch.id)
+        ).scalar_one()
+        assert item.result is ItemResult.NOT_APPLIED
+        assert "not on the account" in (item.amazon_message or "")
+
+    def test_a_confirmed_change_updates_our_picture_of_amazon(
+        self, session, run, listings
+    ):
+        """
+        Decisions are made against Amazon's reported quantity, so that picture
+        has to be kept in step or the next run re-proposes the same change.
+        """
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(200, json=_listing_body(0))
+            return _accept_everything(request)
+
+        decisions = [_decision("EXAMPLE-0007298811035", now=7, want=0)]
+        batch = create_batch(session, run.id, decisions)
+        client = _client(handler)
+        send_batch(session, client, batch, decisions_by_sku={d.seller_sku: d for d in decisions})
+
+        summary = verify_batch(session, client, batch, settle_seconds=0)
+
+        assert summary.verified == 1
+        assert batch.status is BatchStatus.VERIFIED
+        assert session.get(AmazonListing, "EXAMPLE-0007298811035").quantity == 0
+
+
+# ===========================================================================
+# Undo
+# ===========================================================================
+
+
+class TestUndo:
+    def _sent_batch(self, session, run, handler) -> PushBatch:
+        decisions = [
+            _decision("EXAMPLE-0007298811035", now=7, want=0),
+            _decision("EXAMPLE-0001749188257", now=4, want=11),
+        ]
+        batch = create_batch(session, run.id, decisions)
+        send_batch(
+            session, _client(handler), batch,
+            decisions_by_sku={d.seller_sku: d for d in decisions},
+        )
+        return batch
+
+    def test_undo_sends_back_the_exact_previous_quantities(
+        self, session, run, listings
+    ):
+        """The whole point. 0 goes back to 7, 11 goes back to 4."""
+        sent: list[tuple[str, int]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "PATCH":
+                body = json.loads(request.content)
+                qty = body["patches"][0]["value"][0]["quantity"]
+                sent.append((str(request.url).rsplit("/", 1)[-1].split("?")[0], qty))
+            return _accept_everything(request)
+
+        batch = self._sent_batch(session, run, handler)
+        plan = plan_rollback(session, [batch.id])
+
+        assert plan.count == 2, f"expected both items to be reversible: {plan.skipped}"
+        assert {(c.seller_sku, c.desired_quantity) for c in plan.changes} == {
+            ("EXAMPLE-0007298811035", 7),
+            ("EXAMPLE-0001749188257", 4),
+        }
+
+        sent.clear()
+        execute_rollback(
+            session, _client(handler), plan,
+            actor="test@example.com", reason="testing undo on purpose", verify=False,
+        )
+
+        assert dict(sent) == {
+            "EXAMPLE-0007298811035": 7,
+            "EXAMPLE-0001749188257": 4,
+        }
+        assert batch.status is BatchStatus.ROLLED_BACK
+
+    def test_undo_is_not_skipped_just_because_the_catalogue_cache_is_stale(
+        self, session, run, listings
+    ):
+        """
+        THE REGRESSION THIS FILE EXISTS FOR.
+
+        ``amazon_listings.quantity`` is a cache refreshed by the daily All
+        Listings Report, plus whatever verification happens to sample -- 100
+        items out of a large batch. For the unsampled remainder it still holds the
+        pre-push value, which is exactly ``previous_quantity``.
+
+        The old skip condition compared those two and concluded "Amazon already
+        shows what we would restore, nothing to do". So Undo, pressed shortly
+        after a large automatic run, skipped nearly every item and reported
+        "already showing 7" for products Amazon was showing as 0.
+
+        This test reproduces that state precisely: a sent-and-accepted batch,
+        no verification, and a catalogue cache still showing the old quantity.
+        """
+        batch = self._sent_batch(session, run, _accept_everything)
+
+        # Exactly the production state: cache untouched by the push.
+        for sku, stale in (("EXAMPLE-0007298811035", 7), ("EXAMPLE-0001749188257", 4)):
+            assert session.get(AmazonListing, sku).quantity == stale
+        items = session.execute(
+            select(PushItem).where(PushItem.batch_id == batch.id)
+        ).scalars().all()
+        assert all(i.result is ItemResult.ACCEPTED for i in items)
+        assert all(i.verified_quantity is None for i in items), "no verification ran"
+
+        plan = plan_rollback(session, [batch.id])
+
+        assert plan.count == 2, (
+            "Undo skipped items because the catalogue cache was stale. Amazon "
+            f"holds the pushed values, not the cached ones. Skipped: {plan.skipped}"
+        )
+        assert not plan.skipped
+
+    def test_undo_still_skips_an_item_verified_to_be_back_at_its_old_value(
+        self, session, run, listings
+    ):
+        """
+        The skip itself is correct when the evidence is direct. If verification
+        read the SKU back and Amazon is already showing the previous quantity --
+        someone fixed it by hand, say -- there is genuinely nothing to restore.
+        """
+        batch = self._sent_batch(session, run, _accept_everything)
+        item = session.execute(
+            select(PushItem).where(
+                PushItem.batch_id == batch.id,
+                PushItem.seller_sku == "EXAMPLE-0007298811035",
+            )
+        ).scalar_one()
+        item.verified_quantity = item.previous_quantity  # observed, not assumed
+        session.flush()
+
+        plan = plan_rollback(session, [batch.id])
+
+        assert "EXAMPLE-0007298811035" in {sku for sku, _ in plan.skipped}
+        assert plan.count == 1, "the other item is still reversible"
+
+    def test_a_batch_that_sent_nothing_has_nothing_to_undo(self, session, run, listings):
+        """
+        Planning a rollback of an unsent batch yields an empty plan, and trying
+        to execute it is refused. Offering an undo that would silently do
+        nothing is worse than refusing one.
+        """
+        batch = create_batch(session, run.id, [_decision("EXAMPLE-0007298811035", now=7, want=0)])
+        plan = plan_rollback(session, [batch.id])
+
+        assert plan.count == 0
+        assert "Nothing to undo" in plan.summary()
+        with pytest.raises(RollbackError):
+            execute_rollback(
+                session, _client(_accept_everything), plan,
+                actor="test@example.com", verify=False,
+            )
+
+    def test_undoing_twice_is_refused(self, session, run, listings):
+        """
+        Undoing an already-undone batch would push the quantities that the undo
+        replaced -- reapplying the change the operator just reversed.
+        """
+        batch = self._sent_batch(session, run, _accept_everything)
+        execute_rollback(
+            session, _client(_accept_everything), plan_rollback(session, [batch.id]),
+            actor="test@example.com", verify=False,
+        )
+        assert batch.status is BatchStatus.ROLLED_BACK
+
+        second = plan_rollback(session, [batch.id])
+
+        assert second.count == 0, "an already-undone batch must offer nothing to undo"
+        assert ("batch " + str(batch.id), "already rolled back") in second.skipped
+        with pytest.raises(RollbackError):
+            execute_rollback(
+                session, _client(_accept_everything), second,
+                actor="test@example.com", verify=False,
+            )
+
+
+# ===========================================================================
+# Recovery from an interrupted run
+# ===========================================================================
+
+
+class TestRecovery:
+    def test_a_batch_stranded_mid_send_is_settled_by_the_next_run(
+        self, session, run, listings
+    ):
+        """
+        Committing SENDING before the first call makes an interrupted send
+        visible. Something then has to act on it, or the batch sits in SENDING
+        forever and the operator has no idea whether Amazon was changed.
+
+        Simulates the wreckage: one item sent and accepted, one never reached.
+        """
+        decisions = [
+            _decision("EXAMPLE-0007298811035", now=7, want=0),
+            _decision("EXAMPLE-0001749188257", now=4, want=11),
+        ]
+        batch = create_batch(session, run.id, decisions)
+        batch.status = BatchStatus.SENDING
+        items = {
+            i.seller_sku: i
+            for i in session.execute(
+                select(PushItem).where(PushItem.batch_id == batch.id)
+            ).scalars()
+        }
+        items["EXAMPLE-0007298811035"].result = ItemResult.ACCEPTED
+        # The other stays PENDING: the process died before it was sent.
+        session.flush()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(200, json=_listing_body(0))
+            return _accept_everything(request)
+
+        later = Run(
+            trigger=RunTrigger.SCHEDULE, triggered_by="scheduler",
+            mode=SyncMode.AUTOMATIC, status=RunStatus.RUNNING,
+        )
+        session.add(later)
+        session.flush()
+
+        _recover_interrupted_batches(
+            session, later, _client(handler),
+            settings_store.get_all(session), RunOutcome(run_id=later.id, status=RunStatus.RUNNING),
+        )
+
+        assert batch.status is not BatchStatus.SENDING, "the batch was left stranded"
+        # The item that was sent has been checked against Amazon.
+        assert items["EXAMPLE-0007298811035"].result is ItemResult.VERIFIED
+        # The item that never went is marked as such, not silently dropped and
+        # not blindly resent from inside a recovery routine.
+        assert items["EXAMPLE-0001749188257"].result is ItemResult.SKIPPED
+        assert "before this item was sent" in (
+            items["EXAMPLE-0001749188257"].amazon_message or ""
+        )
+        # And both are still undoable, because previous_quantity was committed
+        # before the send began.
+        assert items["EXAMPLE-0007298811035"].previous_quantity == 7
+        assert items["EXAMPLE-0001749188257"].previous_quantity == 4
+
+    def test_nothing_happens_when_there_is_nothing_to_recover(self, session, run):
+        """The common case must be free -- this runs before every single sync."""
+        def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+            raise AssertionError("recovery must not call Amazon when nothing is stranded")
+
+        _recover_interrupted_batches(
+            session, run, _client(handler),
+            settings_store.get_all(session), RunOutcome(run_id=run.id, status=RunStatus.RUNNING),
+        )
+
+
+# ===========================================================================
+# Transport behaviour
+# ===========================================================================
+
+
+class TestTransport:
+    def test_a_401_refreshes_the_token_and_retries_once(self, session, run, listings):
+        """
+        Access tokens last an hour and a long run can cross the boundary. If a
+        401 were treated as a failure, every run straddling the hour would lose
+        part of its batch.
+        """
+        attempts: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            attempts.append(request.method)
+            if len(attempts) == 1:
+                return httpx.Response(401, json={"errors": [{"code": "Unauthorized"}]})
+            return _accept_everything(request)
+
+        client = _client(handler)
+        decisions = [_decision("EXAMPLE-0007298811035", now=7, want=0)]
+        batch = create_batch(session, run.id, decisions)
+        summary = send_batch(
+            session, client, batch, decisions_by_sku={d.seller_sku: d for d in decisions}
+        )
+
+        assert len(attempts) == 2, "the 401 should have been retried exactly once"
+        assert summary.accepted == 1
+        assert client.tokens.invalidations == 1
+
+    def test_a_403_is_a_permission_error_and_not_a_generic_failure(self):
+        """
+        It has its own exception class because it has its own remedy -- tick a
+        role in Developer Central -- and the operator needs to be told that
+        rather than "request failed".
+        """
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(403, json={"errors": [{"code": "Unauthorized"}]})
+
+        client = _client(handler)
+        with pytest.raises(SpApiPermissionError):
+            client.get("/listings/2021-08-01/items/A1TESTSELLER/x", operation="listings.get")
+
+
+# ===========================================================================
+# Practice mode has to be able to READ
+# ===========================================================================
+# Practice mode intercepts by HTTP verb, which is the right fail-safe default
+# and made the whole mode useless. Asking Amazon to build the All Listings
+# Report is a POST -- it carries a body -- and it changes nothing on the
+# account. Intercepted, it returned the synthetic dry-run response with no
+# reportId, every catalogue refresh failed, the Amazon side of the database
+# stayed empty, and so every run correctly and uselessly reported "nothing to
+# change". The client is told to start in practice mode and stay there until
+# they trust the system; they cannot build that trust in a mode where the
+# comparison never happens.
+
+
+class TestPracticeModeCanStillAskForAReport:
+    def test_creating_a_report_reaches_amazon_in_practice_mode(self):
+        """
+        The fix. reports.create must go to the network even in practice mode.
+
+        Asserted by looking for the request at the transport, because the
+        synthetic dry-run response is a 200 as well -- a test that only checked
+        the status code would have passed against the broken behaviour.
+        """
+        calls: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(200, json={"reportId": "report-1"})
+
+        client = _client(handler, dry_run=True)
+        response = client.post(
+            "/reports/2021-06-30/reports",
+            operation="reports.create",
+            json_body={"reportType": "GET_MERCHANT_LISTINGS_ALL_DATA",
+                       "marketplaceIds": ["ATVPDKIKX0DER"]},
+        )
+
+        assert len(calls) == 1, "practice mode swallowed the report request"
+        assert response.json()["reportId"] == "report-1"
+        assert client.dry_run_payloads == [], "a read must not be recorded as a would-be write"
+
+    def test_the_writes_that_matter_are_still_blocked_in_practice_mode(self):
+        """
+        The guarantee that makes the exception above safe to grant.
+
+        A quantity patch and a feed upload are the two ways this system can
+        change the seller's account. Neither may reach the network in practice
+        mode, whatever else is relaxed.
+        """
+        calls: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return _accept_everything(request)
+
+        client = _client(handler, dry_run=True)
+        client.patch(
+            "/listings/2021-08-01/items/A1TESTSELLER/EXAMPLE-0007298811035",
+            operation="listings.patch",
+            json_body={"patches": [{"op": "replace", "path": "/attributes/fulfillment_availability",
+                                    "value": [{"quantity": 3}]}]},
+        )
+        client.post("/feeds/2021-06-30/feeds", operation="feeds.create", json_body={"feedType": "x"})
+
+        assert calls == [], "practice mode reached the network with a real write"
+        assert len(client.dry_run_payloads) == 2
+
+    def test_nothing_that_changes_the_account_can_be_added_to_the_allow_list(self):
+        """
+        Structural guard on the exception itself.
+
+        The allow-list is the one place practice mode can be weakened, and it
+        would be weakened by accident rather than on purpose -- somebody adding
+        an operation to fix a symptom. listings.* and feeds.* are precisely the
+        families that alter the seller's account, so they can never
+        qualify, and this test says so rather than relying on a comment being
+        read.
+        """
+        from app.amazon.client import READ_ONLY_WRITE_OPERATIONS
+
+        for operation in READ_ONLY_WRITE_OPERATIONS:
+            assert not operation.startswith("listings."), operation
+            assert not operation.startswith("feeds."), operation
+
+
+# ===========================================================================
+# Eventual consistency
+# ===========================================================================
+
+
+class TestAmazonTakesItsTimeToApplyAChange:
+    """
+    THE FALSE FAILURE -- the mirror image of :meth:`TestVerification.
+    test_accepted_but_not_applied_is_caught`.
+
+    Amazon's Listings Items API is eventually consistent. A patch it answers
+    ACCEPTED can take many minutes to show up on a read-back, and the read-back
+    ran 30 seconds after the send.
+
+    On 12 September 2026 the first live batch -- 25 products going off sale --
+    was reported as "did not take effect" on every single row. Every one of the
+    25 had in fact been applied; Seller Central showed 0 for all of them when
+    the operator checked by hand shortly afterwards.
+
+    Reporting that as failure is wrong twice over:
+
+      * it tells the operator the system is broken at the exact moment it is
+        working, which is how a person learns to distrust a correct alarm; and
+      * it marks every item NOT_APPLIED, which queues all 25 to be sent again
+        on the next run -- writes to a real account that are not needed.
+
+    "Not confirmed yet" and "confirmed wrong" are different facts and must not
+    share a status.
+    """
+
+    def test_a_change_amazon_has_not_applied_yet_is_not_called_a_failure(
+        self, session, run, listings
+    ):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                # Amazon has taken the patch but not applied it yet.
+                return httpx.Response(200, json=_listing_body(7))
+            return _accept_everything(request)
+
+        decisions = [_decision("EXAMPLE-0007298811035", now=7, want=0)]
+        batch = create_batch(session, run.id, decisions)
+        client = _client(handler)
+        send_batch(session, client, batch, decisions_by_sku={d.seller_sku: d for d in decisions})
+
+        summary = verify_batch(session, client, batch, settle_seconds=0)
+
+        item = session.execute(
+            select(PushItem).where(PushItem.batch_id == batch.id)
+        ).scalar_one()
+
+        # The heart of it: a read-back this soon proves nothing either way.
+        assert item.result is not ItemResult.NOT_APPLIED
+        assert summary.not_applied == 0
+        assert summary.pending_confirmation == 1
+
+        # It is emphatically not "verified" either -- we still do not know.
+        assert batch.status is not BatchStatus.VERIFIED
+        assert summary.verified == 0
+
+        # And it must not be queued for a pointless resend.
+        from app.engine.pusher import collect_retries
+
+        assert "EXAMPLE-0007298811035" not in collect_retries(session)
+
+    def test_a_change_still_missing_long_afterwards_is_a_real_failure(
+        self, session, run, listings
+    ):
+        """
+        The deadline is the other half. Left open for ever, "not confirmed yet"
+        would hide the genuine silent failure this system exists to catch.
+        """
+        from datetime import timedelta
+
+        from app.models import utcnow
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(200, json=_listing_body(7))
+            return _accept_everything(request)
+
+        decisions = [_decision("EXAMPLE-0007298811035", now=7, want=0)]
+        batch = create_batch(session, run.id, decisions)
+        client = _client(handler)
+        send_batch(session, client, batch, decisions_by_sku={d.seller_sku: d for d in decisions})
+
+        # Pretend the send happened long enough ago that Amazon has had every
+        # reasonable chance to apply it.
+        batch.sent_at = utcnow() - timedelta(hours=6)
+        session.flush()
+
+        summary = verify_batch(session, client, batch, settle_seconds=0)
+
+        item = session.execute(
+            select(PushItem).where(PushItem.batch_id == batch.id)
+        ).scalar_one()
+        assert item.result is ItemResult.NOT_APPLIED
+        assert summary.not_applied == 1
+        assert "still shows 7" in (item.amazon_message or "")
+
+
+# ===========================================================================
+# Confirming large batches, and not confirming what was never checked
+# ===========================================================================
+
+def test_catalogue_refresh_confirms_items_a_sampled_batch_left_open(
+    session, run, listings
+):
+    """
+    The promise in the sampling comment must actually be kept.
+
+    A batch above the sample threshold verifies only a handful of SKUs. The
+    docstring said the rest was "settled by the daily catalogue refresh" -- and
+    nothing in the refresh path ever touched push_items, so those items stayed
+    ACCEPTED for ever. A large run reports a few confirmed and never
+    moved, while Amazon had applied every one of them.
+    """
+    batch = create_batch(
+        session,
+        run.id,
+        [
+            _decision("EXAMPLE-0007298811035", now=7, want=0),
+            _decision("EXAMPLE-0001749188257", now=4, want=2),
+        ],
+    )
+    batch.status = BatchStatus.SENT
+    batch.sent_at = utcnow()
+    for item in session.query(PushItem).filter(PushItem.batch_id == batch.id):
+        item.result = ItemResult.ACCEPTED
+    session.flush()
+
+    confirmed, gave_up = confirm_from_catalogue(
+        session,
+        {"EXAMPLE-0007298811035": 0, "EXAMPLE-0001749188257": 2},
+    )
+
+    assert confirmed == 2
+    assert gave_up == 0
+    results = {
+        i.seller_sku: i.result
+        for i in session.query(PushItem).filter(PushItem.batch_id == batch.id)
+    }
+    assert set(results.values()) == {ItemResult.VERIFIED}
+    # The batch, and our picture of Amazon, must move with it.
+    assert batch.verified_count == 2
+    assert batch.status is BatchStatus.VERIFIED
+    assert session.get(AmazonListing, "EXAMPLE-0007298811035").quantity == 0
+
+
+def test_catalogue_refresh_leaves_a_sku_it_cannot_see_alone(session, run, listings):
+    """Absence from the report is not evidence that a change failed."""
+    batch = create_batch(
+        session, run.id, [_decision("EXAMPLE-0007298811035", now=7, want=0)]
+    )
+    batch.status = BatchStatus.SENT
+    batch.sent_at = utcnow()
+    for item in session.query(PushItem).filter(PushItem.batch_id == batch.id):
+        item.result = ItemResult.ACCEPTED
+    session.flush()
+
+    confirmed, gave_up = confirm_from_catalogue(session, {"EXAMPLE-something-else": 3})
+
+    assert (confirmed, gave_up) == (0, 0)
+    item = session.query(PushItem).filter(PushItem.batch_id == batch.id).one()
+    assert item.result is ItemResult.ACCEPTED
+
+
+def test_practice_mode_cannot_confirm_a_batch_that_was_really_sent(
+    session, run, listings
+):
+    """
+    Switching the mode to practice must not launder a real pending batch.
+
+    A practice client never contacts Amazon. The shortcut that marks items
+    VERIFIED exists only so a practice run's own imaginary batch ends tidily.
+    Reached with a batch that was genuinely sent, it would report live changes
+    as confirmed having checked nothing at all -- a false success, which is the
+    worst failure this system can produce.
+    """
+    batch = create_batch(
+        session, run.id, [_decision("EXAMPLE-0007298811035", now=7, want=0)]
+    )
+    batch.status = BatchStatus.SENT
+    batch.sent_at = utcnow()
+    for item in session.query(PushItem).filter(PushItem.batch_id == batch.id):
+        item.result = ItemResult.ACCEPTED
+    session.flush()
+
+    # run.mode is AUTOMATIC: this batch was really sent.
+    summary = verify_batch(
+        session, _client(_accept_everything, dry_run=True), batch, settle_seconds=0
+    )
+
+    assert summary.verified == 0
+    item = session.query(PushItem).filter(PushItem.batch_id == batch.id).one()
+    assert item.result is ItemResult.ACCEPTED
+    assert item.verified_quantity is None

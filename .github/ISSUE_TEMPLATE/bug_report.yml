@@ -1,0 +1,111 @@
+name: Bug report
+description: Something behaves differently from how it is documented or intended
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report.
+
+        **Before you start:** if this is a security problem — a way to extract a
+        credential, bypass authentication, defeat the guardrails, or make the
+        system send a price — please do **not** file it here. See
+        [SECURITY.md](../blob/main/SECURITY.md) for private reporting.
+
+        **Never paste credentials, real SKUs, seller IDs or account
+        identifiers.** Logs are redacted by design, but redaction is not
+        perfect. Replace real values with placeholders.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did the system do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+      description: >
+        Including why. If the current behaviour contradicts something in the
+        docs, a link to it helps a lot.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Set '...'
+        2. Trigger a run with '...'
+        3. Look at '...'
+    validations:
+      required: true
+
+  - type: dropdown
+    id: sync-mode
+    attributes:
+      label: Sync mode
+      description: Which mode was the system in?
+      options:
+        - dry_run (practice)
+        - needs_approval (ask first)
+        - automatic
+        - not applicable
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Did this affect a real seller account?
+      description: >
+        Not a judgement — it decides how fast this gets looked at, and whether
+        a regression test is needed before anything else.
+      options:
+        - "No — practice mode, or a local/test setup"
+        - "Possibly — something was sent but I am not sure of the effect"
+        - "Yes — a quantity was written that should not have been"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: >
+        From `data/logs/app.log`. Check it for identifiers before pasting.
+      render: text
+
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: "e.g. main @ a1b2c3d"
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      value: |
+        - Python:
+        - Database: (PostgreSQL version, or Docker Compose)
+        - OS:
+        - Running under: (uvicorn directly / Docker / a service manager)
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I have removed all credentials and real account identifiers
+          required: true
+        - label: This is not a security vulnerability (those go through SECURITY.md)
+          required: true

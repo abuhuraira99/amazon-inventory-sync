@@ -1,0 +1,744 @@
+"""
+The clock: what runs, and how often.
+
+FOUR JOBS
+=========
+    sync                every N minutes (setting, default 60)
+                        the main pipeline: fetch, decide, send
+
+    catalog_refresh     once a day at a quiet hour (setting, default 03:00 ET)
+                        download the All Listings Report so we know what
+                        Amazon currently shows
+
+    daily_digest        once a day, an hour after the catalogue refresh
+                        the summary email
+
+    housekeeping        hourly
+                        flush queued alerts, delete expired report files
+
+WHY APSCHEDULER AND NOT CELERY
+==============================
+This is one job at a time on one machine. Celery would add a broker, a worker
+process and a beat process -- three more things to install, monitor and restart
+-- to solve a distribution problem that does not exist here. APScheduler runs
+inside the web process and needs nothing.
+
+CONCURRENCY IS NOT THE SCHEDULER'S JOB
+======================================
+Overlap is prevented by a PostgreSQL advisory lock (:func:`app.db.run_lock`),
+not by the scheduler's own ``max_instances``. That matters because the lock also
+holds across processes: if somebody starts a second container, or clicks "Run
+now" while a scheduled run is going, the second one still steps aside. A
+scheduler-level guard would only protect against overlap inside one process.
+
+CHANGING THE INTERVAL
+=====================
+The sync interval is a dashboard setting, so it is re-read on every fire and
+the job reschedules itself when it changes, so going from hourly to every 15
+minutes needs no restart.
+
+That is a correctness requirement, not a convenience. A schedule setting that
+only takes effect on restart is indistinguishable, from the dashboard, from a
+setting that does not work at all -- and nothing reports an error either way.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+
+from app import notifier, services
+from app.amazon.reports import ReportError, fetch_all_listings
+from app.config import settings
+from app.core import settings_store
+from app.db import run_lock, session_scope
+from app.engine.pipeline import execute_run
+from app.engine.pusher import confirm_from_catalogue
+from app.engine.report_builder import prune_old_reports
+from app.models import (
+    AmazonListing,
+    CatalogSync,
+    RunTrigger,
+    utcnow,
+)
+
+log = logging.getLogger(__name__)
+
+JOB_SYNC = "sync"
+JOB_CATALOG = "catalog_refresh"
+JOB_DIGEST = "daily_digest"
+JOB_HOUSEKEEPING = "housekeeping"
+
+_scheduler: BackgroundScheduler | None = None
+
+
+# ===========================================================================
+# Jobs
+# ===========================================================================
+
+def job_sync() -> None:
+    """
+    The main pipeline.
+
+    Takes the exclusive lock; if another run holds it, this one steps aside
+    quietly. That is the correct behaviour for a job firing every 15 minutes --
+    queueing would build a backlog of identical work.
+    """
+    with run_lock() as acquired:
+        if not acquired:
+            log.info("a run is already in progress; skipping this cycle")
+            return
+
+        with session_scope() as session:
+            vendor = services.vendor_credentials(session)
+            if vendor is None:
+                log.warning(
+                    "sync skipped: the vendor connection is not configured. "
+                    "See the banner on the dashboard."
+                )
+                return
+
+            client = services.amazon_client(session)
+            outcome = execute_run(
+                session,
+                client=client,
+                vendor_credentials=vendor,
+                trigger=RunTrigger.SCHEDULE,
+                triggered_by="scheduler",
+            )
+            log.info("run %d finished: %s -- %s", outcome.run_id, outcome.status.value, outcome.message)
+
+            if client is not None:
+                client.close()
+
+            cfg = settings_store.get_all(session)
+            if cfg.get("alert_on_every_run") and outcome.ok:
+                notifier.queue(
+                    session,
+                    kind="run_summary",
+                    severity="info",
+                    subject=f"Inventory sync run {outcome.run_id}: {outcome.status.value}",
+                    body=outcome.message,
+                    run_id=outcome.run_id,
+                )
+            notifier.flush_queue(session)
+
+    apply_schedule_settings()
+
+
+def job_catalog_refresh() -> None:
+    """
+    Download the All Listings Report and update our picture of Amazon.
+
+    Everything depends on this. Without it the decision engine has no idea what
+    Amazon currently shows, so it cannot tell a real difference from a stale
+    one -- and the whole self-healing property of the design comes from
+    comparing against Amazon's own numbers.
+
+    Takes the same lock as the sync: they both write ``amazon_listings``, and a
+    refresh landing halfway through a decision pass would produce a run based
+    on two different snapshots.
+    """
+    with run_lock() as acquired:
+        if not acquired:
+            log.info("catalogue refresh skipped: a run is in progress")
+            return
+
+        with session_scope() as session:
+            client = services.amazon_client(session, force_dry_run=True)  # read-only work
+            if client is None:
+                # Alerted, not just logged. This is a dead end the operator has
+                # to act on, and pressing the dashboard button and receiving
+                # absolutely nothing back is the worst possible response to it.
+                log.warning("catalogue refresh skipped: Amazon is not configured")
+                notifier.queue(
+                    session,
+                    kind="auth_failure",
+                    severity="warning",
+                    subject="Could not refresh the Amazon catalogue",
+                    body=(
+                        "Amazon is not fully configured, so there was nothing to ask. "
+                        "It needs the Client ID and Seller ID in the .env file, and the "
+                        "Client Secret and Refresh Token saved in Settings under "
+                        "Credentials.\n\n"
+                        "Press 'Test Amazon' on the Settings page to see which part is "
+                        "missing."
+                    ),
+                )
+                notifier.flush_queue(session)
+                return
+
+            sync = CatalogSync(status="running")
+            session.add(sync)
+            session.flush()
+
+            try:
+                records, stats, meta = fetch_all_listings(
+                    client, snapshot_dir=settings.backups_dir
+                )
+            except Exception as exc:
+                # DELIBERATELY BROAD. This was `except ReportError`, so a
+                # ReportError produced a clear dashboard alert and anything else
+                # -- an expired refresh token, a 403 from a missing role, a
+                # permissions problem writing the snapshot -- escaped into
+                # APScheduler, which logs it and moves on. Whenever stdout is
+                # discarded, as it is under most service managers, that log goes
+                # nowhere: the button does nothing, says nothing, and leaves no
+                # trace anywhere.
+                #
+                # The operator's question is always "why did nothing happen?",
+                # and the type of the exception is not what decides whether they
+                # deserve an answer. The class name is included because the
+                # message alone is often not enough to tell an authentication
+                # failure from a disk failure.
+                sync.status = "failed"
+                sync.error = f"{type(exc).__name__}: {exc}"
+                sync.finished_at = utcnow()
+                log.exception("catalogue refresh failed")
+                detail = str(exc) if isinstance(exc, ReportError) else f"{type(exc).__name__}: {exc}"
+                notifier.queue(
+                    session,
+                    kind="auth_failure",
+                    severity="warning",
+                    subject="Could not refresh the Amazon catalogue",
+                    body=(
+                        f"{detail}\n\n"
+                        "The system is still using the previous snapshot, so nothing is "
+                        "broken - the figures are just older. It will try again "
+                        "tomorrow, or you can retry now from the dashboard."
+                    ),
+                )
+                notifier.flush_queue(session)
+                return
+            finally:
+                client.close()
+
+            sync.report_id = meta.get("report_id")
+            sync.report_document_id = meta.get("report_document_id")
+            sync.snapshot_path = meta.get("snapshot_path")
+            sync.listing_count = stats.parsed_rows
+
+            cfg = settings_store.get_all(session)
+            prefixes = {p.upper() for p in cfg["sku_prefixes_in_scope"]}
+
+            # Everything currently known, so listings that have disappeared can
+            # be marked rather than silently left behind with a stale quantity.
+            existing = {
+                lst.seller_sku: lst
+                for lst in session.query(AmazonListing).all()
+            }
+            seen: set[str] = set()
+            new_count = 0
+            in_scope = 0
+
+            for rec in records:
+                seen.add(rec.seller_sku)
+                if (rec.sku_prefix or "").upper() in prefixes:
+                    in_scope += 1
+
+                row = existing.get(rec.seller_sku)
+                if row is None:
+                    row = AmazonListing(seller_sku=rec.seller_sku)
+                    session.add(row)
+                    new_count += 1
+
+                row.sku_prefix = rec.sku_prefix
+                row.barcode = rec.barcode or None
+                row.asin = rec.asin
+                row.quantity = rec.quantity
+                row.price = rec.price
+                row.status = rec.status
+                # Amazon's report does not always carry a fulfillment-channel
+                # column, so DEFAULT is the fallback when it is absent. Read
+                # straight off the record rather than smuggled onto it with
+                # setattr: the record is a slotted dataclass, so an attribute
+                # that was never declared cannot be set at all -- and code that
+                # tries fails only against reports that DO have the column.
+                row.fulfillment_channel = rec.fulfillment_channel or (
+                    row.fulfillment_channel or "DEFAULT"
+                )
+                row.blacklisted = rec.seller_sku in set(cfg.get("blacklisted_skus") or [])
+                row.present_in_last_sync = True
+                row.synced_at = utcnow()
+
+            disappeared = 0
+            for sku, row in existing.items():
+                if sku not in seen and row.present_in_last_sync:
+                    row.present_in_last_sync = False
+                    disappeared += 1
+
+            sync.in_scope_count = in_scope
+            sync.new_count = new_count
+            sync.disappeared_count = disappeared
+            sync.status = "completed"
+            sync.finished_at = utcnow()
+
+            # Settle anything still waiting to be confirmed, using the report we
+            # have just downloaded. A large batch verifies only a sample when it
+            # is sent -- reading thousands of SKUs back one at a time takes
+            # longer than the sync interval -- so the remainder has to be
+            # settled from the catalogue report instead. The quantities are
+            # already in memory, so this costs no Amazon requests at all.
+            # A listing with no quantity reported is left out entirely rather
+            # than read as zero: absence is not evidence, and guessing here
+            # would mark a working change "did not stick".
+            confirmed, gave_up = confirm_from_catalogue(
+                session,
+                {
+                    rec.seller_sku: rec.quantity
+                    for rec in records
+                    if rec.quantity is not None
+                },
+            )
+            if confirmed or gave_up:
+                log.info(
+                    "catalogue refresh settled %d outstanding item(s); %d gave up",
+                    confirmed, gave_up,
+                )
+
+            log.info(
+                "catalogue refreshed: %d listings (%d in scope), %d new, %d gone",
+                stats.parsed_rows, in_scope, new_count, disappeared,
+            )
+            notifier.flush_queue(session)
+
+
+def job_daily_digest() -> None:
+    """Send the daily summary."""
+    with session_scope() as session:
+        notifier.send_daily_digest(session)
+        notifier.flush_queue(session)
+
+
+def job_housekeeping() -> None:
+    """
+    Flush queued alerts and delete expired report files.
+
+    Pruning matters more than it sounds: five reports per run at a 15-minute
+    cycle is 480 files a day, and the Current In Stock report is several
+    megabytes. Without this a modest disk fills in weeks, and a full disk
+    stops the sync entirely.
+    """
+    with session_scope() as session:
+        notifier.flush_queue(session)
+        keep = int(settings_store.get(session, "report_retention_days") or 90)
+
+    removed = 0
+    if settings.reports_dir.exists():
+        for directory in settings.reports_dir.iterdir():
+            if directory.is_dir():
+                removed += prune_old_reports(directory, keep_days=keep)
+            elif directory.suffix == ".xlsx":
+                removed += prune_old_reports(settings.reports_dir, keep_days=keep)
+                break
+    if removed:
+        log.info("housekeeping removed %d expired report files", removed)
+
+
+# ===========================================================================
+# Wiring
+# ===========================================================================
+
+def _timezone() -> ZoneInfo:
+    """The configured timezone, falling back rather than crashing on a typo."""
+    with session_scope() as session:
+        name = str(settings_store.get(session, "timezone") or "America/New_York")
+    try:
+        return ZoneInfo(name)
+    except Exception:  # pragma: no cover
+        log.warning("timezone %r is not recognised; using America/New_York", name)
+        return ZoneInfo("America/New_York")
+
+
+def _sync_trigger(interval_minutes: int) -> IntervalTrigger:
+    """
+    The sync trigger, anchored so restarts cannot move the timetable.
+
+    WHY AN ANCHOR AT ALL
+    ====================
+    An interval trigger with no start date begins counting from the moment the
+    process starts. Every restart therefore re-phased the whole schedule: checks
+    that had been landing at 17 past moved to 31 past, then to 09 past, then
+    wherever the next restart happened to fall. During a week of updates the
+    timetable wandered right around the clock.
+
+    That is worse than untidy. The vendor publishes on a fixed clock -- the full
+    feed at about 8 PM their time -- so when our checks happen decides how long
+    a new file waits before anyone sees it, and a schedule that moves cannot be
+    reasoned about at all. It also made the deployment harder to read: an
+    operator who restarts to pick up a change should not have to work out
+    whether a run that just appeared was caused by the restart.
+
+    Anchoring to midnight plus an offset makes the times deterministic and
+    identical after every restart, and it works for any interval rather than
+    only for hour-divisible ones: 60 minutes with an offset of 10 gives 10 past
+    every hour, 15 minutes gives 10, 25, 40 and 55 past.
+
+    APScheduler computes the next fire time forward from the anchor, so a
+    restart lands on the same grid it was already on instead of starting a new
+    one -- and lands on the NEXT slot, which is why restarting no longer fires
+    a run of its own.
+    """
+    tz = _timezone()
+    midnight = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    anchor = midnight + timedelta(minutes=_current_offset_minutes())
+    return IntervalTrigger(minutes=interval_minutes, start_date=anchor, timezone=tz)
+
+
+def _current_offset_minutes() -> int:
+    """
+    The configured minutes past the hour, clamped to a real minute.
+
+    Its own function so that the trigger builder and the rescheduler below read
+    exactly the same value. When the rescheduler had its own idea of the offset
+    -- or, as it did at first, no idea of it at all -- changing the setting did
+    nothing until the next restart.
+    """
+    with session_scope() as session:
+        offset = int(settings_store.get(session, "sync_offset_minutes") or 0)
+    return max(0, min(59, offset))
+
+
+def _current_interval_minutes() -> int:
+    with session_scope() as session:
+        return int(settings_store.get(session, "sync_interval_minutes") or 60)
+
+
+def _current_catalog_hour() -> int:
+    with session_scope() as session:
+        hour = int(settings_store.get(session, "catalog_refresh_hour") or 3)
+    return max(0, min(23, hour))
+
+
+def _current_catalog_config() -> tuple[bool, int, int]:
+    """
+    ``(hourly, hour, minute)`` for the catalogue refresh.
+
+    One function, read by both the trigger builder and the rescheduler, for the
+    same reason :func:`_current_offset_minutes` exists: when the two disagreed
+    about where a value came from, saving the setting changed the page and
+    nothing else. Every caller reads it here or not at all.
+    """
+    with session_scope() as session:
+        hourly = bool(settings_store.get(session, "catalog_refresh_hourly"))
+        hour = int(settings_store.get(session, "catalog_refresh_hour") or 3)
+        minute = int(settings_store.get(session, "catalog_refresh_offset_minutes") or 0)
+    return hourly, max(0, min(23, hour)), max(0, min(59, minute))
+
+
+def _catalog_trigger(hour: int, tz: ZoneInfo, *, hourly: bool = False, minute: int = 0) -> CronTrigger:
+    """
+    The catalogue refresh. Defined once, so start() cannot drift.
+
+    Hourly keeps our picture of Amazon minutes old instead of up to a day old,
+    which matters because every decision is made against that picture. It also
+    settles items that were sent but only sampled at verification time -- the
+    report it downloads carries every quantity already, so confirming from it
+    costs no extra Amazon requests.
+    """
+    if hourly:
+        return CronTrigger(minute=minute, timezone=tz)
+    return CronTrigger(hour=hour, minute=0, timezone=tz)
+
+
+def _digest_trigger(hour: int, tz: ZoneInfo) -> CronTrigger:
+    """
+    The daily summary, an hour and a half after the catalogue refresh starts.
+
+    Derived from the catalogue hour rather than configured separately so the
+    summary always describes a catalogue that has just been refreshed. The
+    :30 is a deliberate gap, not a magic number: it gives the refresh time to
+    finish before the mail that reports on it is built.
+    """
+    return CronTrigger(hour=(hour + 1) % 24, minute=30, timezone=tz)
+
+
+def _reschedule_sync_if_needed() -> None:
+    """
+    Re-read the interval and reschedule if it changed.
+
+    Done after each run rather than on a timer, so a change takes effect from
+    the next cycle without a restart.
+    """
+    global _scheduler
+    if _scheduler is None:
+        return
+
+    job = _scheduler.get_job(JOB_SYNC)
+    if job is None:
+        return
+
+    wanted = _current_interval_minutes()
+    current = getattr(job.trigger, "interval", None)
+    current_minutes = int(current.total_seconds() // 60) if current else None
+
+    # EVERY INPUT TO THE TRIGGER IS CHECKED, AND ONLY THE INTERVAL WAS AT FIRST.
+    # Comparing one of the three inputs meant the other two looked hard-coded:
+    # the trigger kept the grid it was built with at start-up, and a change to
+    # "minutes past the hour" -- or to the timezone -- did nothing at all until
+    # the next restart, with no indication why. Reading each value off the live
+    # trigger rather than tracking it separately means there is nothing to keep
+    # in step, and adding a fourth input later cannot silently skip this check.
+    start = getattr(job.trigger, "start_date", None)
+    current_offset = start.minute if start is not None else None
+    wanted_offset = _current_offset_minutes()
+
+    current_tz = str(getattr(job.trigger, "timezone", "") or "")
+    wanted_tz = _timezone()
+
+    if (
+        current_minutes != wanted
+        or current_offset != wanted_offset
+        or current_tz != wanted_tz.key
+    ):
+        log.info(
+            "sync schedule changed from every %s min at :%s %s to every %s min at :%s %s; "
+            "rescheduling",
+            current_minutes, current_offset, current_tz,
+            wanted, wanted_offset, wanted_tz.key,
+        )
+        _scheduler.reschedule_job(JOB_SYNC, trigger=_sync_trigger(wanted))
+
+
+def _reschedule_daily_jobs_if_needed() -> None:
+    """
+    Re-read the catalogue hour and the timezone, and move the nightly jobs.
+
+    THE SAME BUG AS THE SYNC SCHEDULE HAD, IN TWO MORE PLACES.
+    ==========================================================
+    The catalogue refresh and the daily summary were built once, in ``start()``,
+    from ``catalog_refresh_hour`` and the timezone -- and then never looked at
+    again. Nothing re-read them, so both settings behaved exactly the way the
+    sync offset did before it was fixed: editable on the dashboard, saved
+    without complaint, shown back correctly on the page, and completely without
+    effect until somebody happened to restart the service. An operator moving
+    the refresh off a busy hour would have watched it keep running at the old
+    one and reasonably concluded the hour was hard-coded.
+
+    The timezone is the more dangerous of the two, because moving it is exactly
+    what a deployment does when it discovers the vendor is not in the zone
+    everyone assumed. Changing it corrects which files count as "today" on the
+    very next run -- the pipeline re-reads its settings every run -- while the
+    catalogue refresh carried on firing on the old zone's clock. Los Angeles
+    instead of New York moves 3 AM to midnight: still nightly, still plausible
+    in the log, and three hours from where it was asked to be.
+    """
+    global _scheduler
+    if _scheduler is None:
+        return
+
+    tz = _timezone()
+    hourly, hour, minute = _current_catalog_config()
+
+    # Compared as whole triggers rather than by hour alone. The hour comparison
+    # was enough while the refresh could only be nightly; it silently cannot see
+    # a change of MINUTE, and an hourly trigger has no single hour to read at
+    # all, so it would have reported "no change" for ever. This is the exact
+    # shape of the bug that made the sync offset look hard-coded: compare the
+    # whole thing, or the setting is decorative.
+    wanted = {
+        JOB_CATALOG: _catalog_trigger(hour, tz, hourly=hourly, minute=minute),
+        JOB_DIGEST: _digest_trigger(hour, tz),
+    }
+
+    for job_id, trigger in wanted.items():
+        job = _scheduler.get_job(job_id)
+        if job is None:
+            continue
+
+        # repr, not str: CronTrigger.__str__ prints the fields and omits the
+        # timezone entirely, so comparing str() would have silently ignored a
+        # change of zone -- the single most dangerous schedule setting there is,
+        # and the one with its own regression test. repr carries it.
+        if repr(job.trigger) == repr(trigger):
+            continue
+
+        log.info(
+            "%s schedule changed from [%s] to [%s]; rescheduling",
+            job_id, repr(job.trigger), repr(trigger),
+        )
+        _scheduler.reschedule_job(job_id, trigger=trigger)
+
+
+def _cron_hour(trigger: object) -> int | None:
+    """The hour a cron trigger fires on, or None if it is not that shape."""
+    for field in getattr(trigger, "fields", []) or []:
+        if getattr(field, "name", "") == "hour":
+            try:
+                return int(str(field))
+            except ValueError:  # a range or list -- not something we build
+                return None
+    return None
+
+
+def apply_schedule_settings() -> None:
+    """
+    Make every schedule match the settings as they are right now.
+
+    Called after each run AND the moment the settings form is saved, so a
+    change is visible on the dashboard's "next run" immediately instead of
+    after the next cycle. That matters more than it sounds: with a 60-minute
+    interval, waiting for the next run meant a change made at five past could
+    show no effect until nearly two hours later, which is indistinguishable
+    from the setting being ignored -- and one setting genuinely was.
+
+    Safe to call from a web request. It only ever compares settings against the
+    live triggers and rebuilds the ones that no longer match; it never starts a
+    run, and when the scheduler is disabled it does nothing at all.
+    """
+    if _scheduler is None:
+        return
+    try:
+        _reschedule_sync_if_needed()
+        _reschedule_daily_jobs_if_needed()
+    except Exception:  # pragma: no cover - never break a save over a schedule
+        log.exception("could not apply the schedule settings")
+
+
+def start() -> BackgroundScheduler | None:
+    """
+    Start the scheduler. Returns it, or None when scheduling is disabled.
+
+    Called from the FastAPI lifespan handler. Disabled by ``ENABLE_SCHEDULER``
+    so a second container can serve the dashboard without also running the
+    jobs -- exactly one process must own them.
+    """
+    global _scheduler
+
+    if not settings.enable_scheduler:
+        log.info("scheduler disabled by configuration")
+        return None
+    if _scheduler is not None:  # pragma: no cover
+        return _scheduler
+
+    tz = _timezone()
+    interval = _current_interval_minutes()
+
+    catalog_hourly, catalog_hour, catalog_minute = _current_catalog_config()
+
+    scheduler = BackgroundScheduler(
+        timezone=tz,
+        job_defaults={
+            # The advisory lock already prevents overlap; this stops a slow run
+            # from stacking up scheduler threads behind it.
+            "max_instances": 1,
+            # If the process was down, run once on return rather than firing
+            # every missed cycle in a burst.
+            "coalesce": True,
+            # A run may legitimately take a while: a million-row full feed
+            # plus thousands of Amazon writes. Being late is not a reason to
+            # skip.
+            "misfire_grace_time": 3600,
+        },
+    )
+
+    scheduler.add_job(
+        job_sync,
+        trigger=_sync_trigger(interval),
+        id=JOB_SYNC,
+        name="Check the vendor and sync quantities",
+        replace_existing=True,
+        # NO next_run_time HERE, DELIBERATELY. It used to be set to
+        # datetime.now(), directly under a comment claiming the opposite --
+        # "not immediately on boot". It fired a run the instant the process
+        # started, and that is only half the damage: once APScheduler has a
+        # previous fire time it computes the next one as previous + interval
+        # and stops consulting the trigger's anchor at all. So the entire
+        # timetable re-based itself on whatever minute the server happened to
+        # be restarted, and the "minutes past the hour" setting did nothing
+        # whatsoever. Restarting six times in an evening moved the schedule
+        # six times, and an operator restarting to pick up a change could not
+        # tell that run apart from a real one.
+        #
+        # Left to the trigger, the first fire is the next slot on the anchored
+        # grid -- which also satisfies what that comment was reaching for far
+        # better than firing instantly did: the web process gets time to
+        # finish starting, and there is a window in which to pause the system
+        # mid-deployment.
+    )
+
+    scheduler.add_job(
+        job_catalog_refresh,
+        trigger=_catalog_trigger(
+            catalog_hour, tz, hourly=catalog_hourly, minute=catalog_minute
+        ),
+        id=JOB_CATALOG,
+        name="Refresh the Amazon catalogue",
+        replace_existing=True,
+    )
+
+    scheduler.add_job(
+        job_daily_digest,
+        trigger=_digest_trigger(catalog_hour, tz),
+        id=JOB_DIGEST,
+        name="Send the daily summary",
+        replace_existing=True,
+    )
+
+    scheduler.add_job(
+        job_housekeeping,
+        trigger=IntervalTrigger(hours=1),
+        id=JOB_HOUSEKEEPING,
+        name="Send queued alerts and tidy up old reports",
+        replace_existing=True,
+    )
+
+    scheduler.start()
+    _scheduler = scheduler
+
+    log.info(
+        "scheduler started: sync every %d min, catalogue at %02d:00 %s",
+        interval, catalog_hour, tz.key,
+    )
+    return scheduler
+
+
+def shutdown() -> None:
+    """Stop the scheduler, letting a running job finish."""
+    global _scheduler
+    if _scheduler is not None:
+        log.info("stopping the scheduler; waiting for any running job")
+        _scheduler.shutdown(wait=True)
+        _scheduler = None
+
+
+def status() -> list[dict]:
+    """
+    What is scheduled and when it next fires, for the dashboard.
+
+    The "next run" time is one of the first things an operator looks for when
+    something seems stuck, so it is worth surfacing prominently.
+    """
+    if _scheduler is None:
+        return []
+    return [
+        {
+            "id": job.id,
+            "name": job.name,
+            "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
+            "trigger": str(job.trigger),
+        }
+        for job in _scheduler.get_jobs()
+    ]
+
+
+def trigger_now(job_id: str) -> bool:
+    """
+    Run a job immediately, from the dashboard's "Run now" button.
+
+    Does not bypass anything: the job still takes the lock, still checks the
+    pause switch, and still honours the mode.
+    """
+    if _scheduler is None:
+        return False
+    job = _scheduler.get_job(job_id)
+    if job is None:
+        return False
+    job.modify(next_run_time=datetime.now(_timezone()))
+    log.info("job %s triggered manually", job_id)
+    return True
